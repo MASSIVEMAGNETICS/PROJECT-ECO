@@ -34,13 +34,20 @@ data:
 
 ---
 # Secret for sensitive configuration
+# WARNING: These are placeholder values. In production, use external secret
+# management (e.g., HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager)
+# or replace via Helm values / Kustomize overlays during deployment.
 apiVersion: v1
 kind: Secret
 metadata:
   name: victor-secrets
   namespace: victor-system
+  annotations:
+    # Mark as requiring replacement before production deployment
+    production-readiness: "requires-secret-replacement"
 type: Opaque
 stringData:
+  # IMPORTANT: Replace these placeholder values before production deployment
   VECTOR_DB_API_KEY: "placeholder-replace-in-production"
   GRAPH_DB_PASSWORD: "placeholder-replace-in-production"
   TIMESERIES_DB_TOKEN: "placeholder-replace-in-production"
@@ -130,6 +137,7 @@ spec:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      serviceAccountName: victor-service-account
       containers:
         - name: victor-core
           image: victor-system/victor-core:latest
@@ -506,6 +514,9 @@ spec:
 
 ---
 # StatefulSet for Graph Database
+# NOTE: Using Neo4j Enterprise requires a valid license. For production,
+# ensure proper licensing is in place. For development/testing without
+# enterprise features, use neo4j:5-community instead.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -526,6 +537,7 @@ spec:
     spec:
       containers:
         - name: neo4j
+          # Enterprise edition requires license - use neo4j:5-community for testing
           image: neo4j:5-enterprise
           ports:
             - containerPort: 7474

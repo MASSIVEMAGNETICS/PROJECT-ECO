@@ -86,7 +86,13 @@ class CircuitBreaker:
                 return False
     
     def _should_attempt_recovery(self) -> bool:
-        """Check if enough time has passed to attempt recovery."""
+        """Check if enough time has passed to attempt recovery.
+        
+        Returns True if:
+        - No failure has been recorded yet (last_failure_time is None), which means
+          recovery is allowed since there's no failure state to recover from
+        - Enough time has passed since the last failure to attempt recovery
+        """
         if self.last_failure_time is None:
             return True
         return (time.time() - self.last_failure_time) >= self.config.recovery_timeout

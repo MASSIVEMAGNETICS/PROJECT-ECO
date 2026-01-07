@@ -541,6 +541,10 @@ class ConsciousnessTracker:
         temporal = consciousness_input.temporal_context
         
         # Coherence based on temporal consistency
+        # When insufficient temporal data exists (< 2 timepoints), we assume
+        # maximum coherence (1.0) as there's no basis for detecting incoherence.
+        # This is a conservative default that indicates "no evidence of incoherence"
+        # rather than "confirmed coherence".
         if len(temporal) < 2:
             return 1.0
         
