@@ -1,0 +1,637 @@
+# VICTOR Prometheus Monitoring Configuration
+# Comprehensive metrics collection for enterprise-grade AGI infrastructure
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'victor-production'
+    env: 'production'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+      scheme: http
+      timeout: 10s
+      api_version: v2
+
+# Rule files
+rule_files:
+  - /etc/prometheus/rules/*.yaml
+
+# Scrape configurations
+scrape_configs:
+  # ==========================================================================
+  # VICTOR CORE METRICS
+  # ==========================================================================
+  
+  - job_name: 'victor-core'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - victor-system
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: victor
+      - source_labels: [__meta_kubernetes_pod_label_component]
+        action: keep
+        regex: core
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'victor_(.*)'
+        target_label: metric_category
+        replacement: 'victor'
+
+  # ==========================================================================
+  # GPU METRICS (NVIDIA DCGM)
+  # ==========================================================================
+  
+  - job_name: 'dcgm-exporter'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - gpu-operator
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: dcgm-exporter
+      - source_labels: [__address__]
+        action: replace
+        regex: ([^:]+)(?::\d+)?
+        replacement: $1:9400
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        target_label: node
+    metric_relabel_configs:
+      # GPU utilization
+      - source_labels: [__name__]
+        regex: 'DCGM_FI_DEV_(GPU_UTIL|MEM_COPY_UTIL|ENC_UTIL|DEC_UTIL)'
+        target_label: gpu_metric_type
+        replacement: 'utilization'
+      # GPU memory
+      - source_labels: [__name__]
+        regex: 'DCGM_FI_DEV_(FB_FREE|FB_USED|FB_TOTAL)'
+        target_label: gpu_metric_type
+        replacement: 'memory'
+      # GPU temperature
+      - source_labels: [__name__]
+        regex: 'DCGM_FI_DEV_(GPU_TEMP|MEMORY_TEMP)'
+        target_label: gpu_metric_type
+        replacement: 'temperature'
+      # GPU power
+      - source_labels: [__name__]
+        regex: 'DCGM_FI_DEV_(POWER_USAGE|TOTAL_ENERGY_CONSUMPTION)'
+        target_label: gpu_metric_type
+        replacement: 'power'
+
+  # ==========================================================================
+  # DATABASE METRICS
+  # ==========================================================================
+  
+  # Vector Database (Weaviate)
+  - job_name: 'victor-vectordb'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - victor-system
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: vectordb
+      - source_labels: [__address__]
+        action: replace
+        regex: ([^:]+)(?::\d+)?
+        replacement: $1:2112
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+
+  # Graph Database (Neo4j)
+  - job_name: 'victor-graphdb'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - victor-system
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: graphdb
+      - source_labels: [__address__]
+        action: replace
+        regex: ([^:]+)(?::\d+)?
+        replacement: $1:2004
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+
+  # Time-Series Database (InfluxDB)
+  - job_name: 'victor-timeseriesdb'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - victor-system
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: timeseriesdb
+      - source_labels: [__address__]
+        action: replace
+        regex: ([^:]+)(?::\d+)?
+        replacement: $1:8086
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - target_label: __metrics_path__
+        replacement: /metrics
+
+  # ==========================================================================
+  # KUBERNETES INFRASTRUCTURE
+  # ==========================================================================
+  
+  - job_name: 'kubernetes-apiservers'
+    kubernetes_sd_configs:
+      - role: endpoints
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: default;kubernetes;https
+
+  - job_name: 'kubernetes-nodes'
+    kubernetes_sd_configs:
+      - role: node
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/$1/proxy/metrics
+
+  - job_name: 'kubernetes-cadvisor'
+    kubernetes_sd_configs:
+      - role: node
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+
+---
+# Prometheus Alert Rules
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: monitoring
+data:
+  victor-alerts.yaml: |
+    groups:
+      - name: victor-core-alerts
+        rules:
+          # ==========================================================================
+          # HIGH PRIORITY ALERTS
+          # ==========================================================================
+          
+          - alert: VictorCoreDown
+            expr: up{job="victor-core"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              team: victor-ops
+            annotations:
+              summary: "Victor Core instance is down"
+              description: "Victor Core pod {{ $labels.pod }} has been down for more than 1 minute."
+              runbook_url: "https://runbooks.example.com/victor/core-down"
+          
+          - alert: VictorHighErrorRate
+            expr: |
+              sum(rate(victor_request_errors_total[5m])) by (pod)
+              /
+              sum(rate(victor_request_total[5m])) by (pod)
+              > 0.05
+            for: 5m
+            labels:
+              severity: critical
+              team: victor-ops
+            annotations:
+              summary: "High error rate in Victor Core"
+              description: "Error rate is {{ $value | humanizePercentage }} for pod {{ $labels.pod }}."
+          
+          - alert: VictorHighLatency
+            expr: |
+              histogram_quantile(0.99, sum(rate(victor_request_duration_seconds_bucket[5m])) by (le, pod))
+              > 5
+            for: 5m
+            labels:
+              severity: warning
+              team: victor-ops
+            annotations:
+              summary: "High latency in Victor Core"
+              description: "P99 latency is {{ $value }}s for pod {{ $labels.pod }}."
+          
+          # ==========================================================================
+          # GPU ALERTS
+          # ==========================================================================
+          
+          - alert: GPUMemoryNearLimit
+            expr: |
+              DCGM_FI_DEV_FB_USED / DCGM_FI_DEV_FB_TOTAL > 0.90
+            for: 5m
+            labels:
+              severity: warning
+              team: victor-ops
+            annotations:
+              summary: "GPU memory usage near limit"
+              description: "GPU {{ $labels.gpu }} on node {{ $labels.node }} is using {{ $value | humanizePercentage }} of memory."
+          
+          - alert: GPUTemperatureHigh
+            expr: DCGM_FI_DEV_GPU_TEMP > 80
+            for: 5m
+            labels:
+              severity: warning
+              team: victor-ops
+            annotations:
+              summary: "GPU temperature high"
+              description: "GPU {{ $labels.gpu }} on node {{ $labels.node }} temperature is {{ $value }}°C."
+          
+          - alert: GPUTemperatureCritical
+            expr: DCGM_FI_DEV_GPU_TEMP > 90
+            for: 1m
+            labels:
+              severity: critical
+              team: victor-ops
+            annotations:
+              summary: "GPU temperature critical"
+              description: "GPU {{ $labels.gpu }} on node {{ $labels.node }} temperature is {{ $value }}°C."
+          
+          - alert: GPULowUtilization
+            expr: DCGM_FI_DEV_GPU_UTIL < 10
+            for: 30m
+            labels:
+              severity: info
+              team: victor-ops
+            annotations:
+              summary: "GPU underutilized"
+              description: "GPU {{ $labels.gpu }} on node {{ $labels.node }} utilization is {{ $value }}%."
+          
+          # ==========================================================================
+          # DATABASE ALERTS
+          # ==========================================================================
+          
+          - alert: VectorDBDown
+            expr: up{job="victor-vectordb"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              team: victor-ops
+            annotations:
+              summary: "Vector database is down"
+              description: "Vector database pod {{ $labels.pod }} is not responding."
+          
+          - alert: GraphDBDown
+            expr: up{job="victor-graphdb"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              team: victor-ops
+            annotations:
+              summary: "Graph database is down"
+              description: "Graph database pod {{ $labels.pod }} is not responding."
+          
+          - alert: TimeSeriesDBDown
+            expr: up{job="victor-timeseriesdb"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              team: victor-ops
+            annotations:
+              summary: "Time-series database is down"
+              description: "Time-series database pod {{ $labels.pod }} is not responding."
+          
+          - alert: DatabaseHighLatency
+            expr: |
+              histogram_quantile(0.95, sum(rate(database_query_duration_seconds_bucket[5m])) by (le, database))
+              > 1
+            for: 5m
+            labels:
+              severity: warning
+              team: victor-ops
+            annotations:
+              summary: "Database query latency high"
+              description: "P95 query latency for {{ $labels.database }} is {{ $value }}s."
+          
+          # ==========================================================================
+          # CIRCUIT BREAKER ALERTS
+          # ==========================================================================
+          
+          - alert: CircuitBreakerOpen
+            expr: victor_circuit_breaker_state{state="open"} == 1
+            for: 1m
+            labels:
+              severity: warning
+              team: victor-ops
+            annotations:
+              summary: "Circuit breaker is open"
+              description: "Circuit breaker {{ $labels.circuit }} is open on pod {{ $labels.pod }}."
+          
+          - alert: CircuitBreakerHalfOpen
+            expr: victor_circuit_breaker_state{state="half_open"} == 1
+            for: 5m
+            labels:
+              severity: info
+              team: victor-ops
+            annotations:
+              summary: "Circuit breaker in half-open state"
+              description: "Circuit breaker {{ $labels.circuit }} has been in half-open state for 5 minutes."
+          
+          # ==========================================================================
+          # CONSCIOUSNESS METRICS ALERTS
+          # ==========================================================================
+          
+          - alert: LowCoherenceScore
+            expr: victor_consciousness_coherence_score < 0.5
+            for: 10m
+            labels:
+              severity: warning
+              team: victor-ml
+            annotations:
+              summary: "Low consciousness coherence"
+              description: "Coherence score on pod {{ $labels.pod }} is {{ $value }}, below threshold."
+          
+          - alert: HighEntropyAnomaly
+            expr: |
+              victor_consciousness_entropy > 
+              avg_over_time(victor_consciousness_entropy[1h]) + 
+              2 * stddev_over_time(victor_consciousness_entropy[1h])
+            for: 5m
+            labels:
+              severity: info
+              team: victor-ml
+            annotations:
+              summary: "Entropy anomaly detected"
+              description: "Consciousness entropy on pod {{ $labels.pod }} is unusually high."
+          
+          # ==========================================================================
+          # RESOURCE ALERTS
+          # ==========================================================================
+          
+          - alert: PodMemoryNearLimit
+            expr: |
+              container_memory_working_set_bytes{namespace="victor-system"}
+              /
+              container_spec_memory_limit_bytes{namespace="victor-system"}
+              > 0.85
+            for: 5m
+            labels:
+              severity: warning
+              team: victor-ops
+            annotations:
+              summary: "Pod memory usage near limit"
+              description: "Pod {{ $labels.pod }} is using {{ $value | humanizePercentage }} of memory limit."
+          
+          - alert: PodCPUThrottled
+            expr: |
+              sum(rate(container_cpu_cfs_throttled_seconds_total{namespace="victor-system"}[5m])) by (pod)
+              > 0.5
+            for: 5m
+            labels:
+              severity: warning
+              team: victor-ops
+            annotations:
+              summary: "Pod CPU being throttled"
+              description: "Pod {{ $labels.pod }} is being CPU throttled."
+          
+          - alert: HighPodRestartRate
+            expr: |
+              increase(kube_pod_container_status_restarts_total{namespace="victor-system"}[1h])
+              > 3
+            labels:
+              severity: warning
+              team: victor-ops
+            annotations:
+              summary: "High pod restart rate"
+              description: "Pod {{ $labels.pod }} has restarted {{ $value }} times in the last hour."
+
+---
+# Grafana Dashboard ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  victor-overview.json: |
+    {
+      "annotations": {
+        "list": []
+      },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 0,
+      "id": null,
+      "links": [],
+      "liveNow": false,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "green", "value": null},
+                  {"color": "red", "value": 80}
+                ]
+              }
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+          "id": 1,
+          "options": {
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "pluginVersion": "10.0.0",
+          "targets": [
+            {
+              "expr": "sum(up{job=\"victor-core\"})",
+              "legendFormat": "Active Instances"
+            }
+          ],
+          "title": "Victor Core Instances",
+          "type": "gauge"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {"legend": false, "tooltip": false, "viz": false},
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {"type": "linear"},
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {"group": "A", "mode": "none"},
+                "thresholdsStyle": {"mode": "off"}
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [{"color": "green", "value": null}]
+              }
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+          "id": 2,
+          "targets": [
+            {
+              "expr": "rate(victor_generation_total[5m])",
+              "legendFormat": "{{pod}}"
+            }
+          ],
+          "title": "Generation Rate",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "continuous-GrYlRd"},
+              "mappings": [],
+              "max": 1,
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [{"color": "green", "value": null}]
+              }
+            }
+          },
+          "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+          "id": 3,
+          "targets": [
+            {
+              "expr": "avg(victor_consciousness_awareness_level)",
+              "legendFormat": "Awareness"
+            }
+          ],
+          "title": "Consciousness Awareness",
+          "type": "gauge"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "continuous-BlPu"},
+              "mappings": [],
+              "max": 1,
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [{"color": "green", "value": null}]
+              }
+            }
+          },
+          "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+          "id": 4,
+          "targets": [
+            {
+              "expr": "avg(victor_consciousness_coherence_score)",
+              "legendFormat": "Coherence"
+            }
+          ],
+          "title": "Consciousness Coherence",
+          "type": "gauge"
+        },
+        {
+          "datasource": "Prometheus",
+          "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+          "id": 5,
+          "targets": [
+            {
+              "expr": "avg(DCGM_FI_DEV_GPU_UTIL)",
+              "legendFormat": "GPU Utilization %"
+            }
+          ],
+          "title": "Average GPU Utilization",
+          "type": "gauge"
+        }
+      ],
+      "refresh": "5s",
+      "schemaVersion": 38,
+      "style": "dark",
+      "tags": ["victor", "ai", "monitoring"],
+      "templating": {"list": []},
+      "time": {"from": "now-1h", "to": "now"},
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "VICTOR System Overview",
+      "uid": "victor-overview",
+      "version": 1,
+      "weekStart": ""
+    }

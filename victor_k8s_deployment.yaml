@@ -1,0 +1,664 @@
+# VICTOR Kubernetes Deployment Manifest
+# Enterprise-grade autonomous intelligence system deployment
+
+---
+# Namespace for Victor system
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: victor-system
+  labels:
+    app: victor
+    environment: production
+
+---
+# ConfigMap for Victor configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: victor-config
+  namespace: victor-system
+data:
+  DEPLOYMENT_MODE: "prod"
+  LOG_LEVEL: "INFO"
+  CHECKPOINT_INTERVAL: "50"
+  MAX_WORKERS: "8"
+  BATCH_SIZE: "16"
+  MODEL_PRECISION: "bf16"
+  ENABLE_MONITORING: "true"
+  VECTOR_DB_HOST: "victor-vectordb"
+  VECTOR_DB_PORT: "8080"
+  GRAPH_DB_URI: "bolt://victor-graphdb:7687"
+  TIMESERIES_DB_HOST: "victor-timeseriesdb"
+  TIMESERIES_DB_PORT: "8086"
+
+---
+# Secret for sensitive configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: victor-secrets
+  namespace: victor-system
+type: Opaque
+stringData:
+  VECTOR_DB_API_KEY: "placeholder-replace-in-production"
+  GRAPH_DB_PASSWORD: "placeholder-replace-in-production"
+  TIMESERIES_DB_TOKEN: "placeholder-replace-in-production"
+
+---
+# PersistentVolumeClaim for checkpoints
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: victor-checkpoints-pvc
+  namespace: victor-system
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: fast-ssd
+
+---
+# PersistentVolumeClaim for model artifacts
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: victor-models-pvc
+  namespace: victor-system
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 500Gi
+  storageClassName: fast-ssd
+
+---
+# Main Victor Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: victor-core
+  namespace: victor-system
+  labels:
+    app: victor
+    component: core
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: victor
+      component: core
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: victor
+        component: core
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-SXM4-40GB
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-H100-SXM5-80GB
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: victor
+                    component: core
+                topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: victor-core
+          image: victor-system/victor-core:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 8001
+              name: grpc
+            - containerPort: 9090
+              name: metrics
+          envFrom:
+            - configMapRef:
+                name: victor-config
+            - secretRef:
+                name: victor-secrets
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CHECKPOINT_DIR
+              value: "/data/checkpoints"
+          resources:
+            requests:
+              memory: "32Gi"
+              cpu: "8"
+              nvidia.com/gpu: 1
+            limits:
+              memory: "64Gi"
+              cpu: "16"
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /data/checkpoints
+            - name: models
+              mountPath: /data/models
+              readOnly: true
+            - name: shared-memory
+              mountPath: /dev/shm
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "sleep 10 && /app/shutdown.sh"
+      volumes:
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: victor-checkpoints-pvc
+        - name: models
+          persistentVolumeClaim:
+            claimName: victor-models-pvc
+        - name: shared-memory
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      terminationGracePeriodSeconds: 120
+
+---
+# Service for Victor Core
+apiVersion: v1
+kind: Service
+metadata:
+  name: victor-core
+  namespace: victor-system
+  labels:
+    app: victor
+    component: core
+spec:
+  type: ClusterIP
+  selector:
+    app: victor
+    component: core
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: grpc
+      port: 8001
+      targetPort: 8001
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: victor-core-hpa
+  namespace: victor-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: victor-core
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+    - type: Pods
+      pods:
+        metric:
+          name: requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "100"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+---
+# PodDisruptionBudget for high availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: victor-core-pdb
+  namespace: victor-system
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: victor
+      component: core
+
+---
+# Network Policy for security isolation
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: victor-network-policy
+  namespace: victor-system
+spec:
+  podSelector:
+    matchLabels:
+      app: victor
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+        - podSelector:
+            matchLabels:
+              app: victor
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 8001
+        - protocol: TCP
+          port: 9090
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: victor
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 8001
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app: vectordb
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app: graphdb
+      ports:
+        - protocol: TCP
+          port: 7687
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app: timeseriesdb
+      ports:
+        - protocol: TCP
+          port: 8086
+
+---
+# Ingress for external access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: victor-ingress
+  namespace: victor-system
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  tls:
+    - hosts:
+        - victor.example.com
+      secretName: victor-tls
+  rules:
+    - host: victor.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: victor-core
+                port:
+                  number: 8000
+
+---
+# ServiceAccount for Victor pods
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: victor-service-account
+  namespace: victor-system
+
+---
+# Role for Victor permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: victor-role
+  namespace: victor-system
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+---
+# RoleBinding for Victor
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: victor-role-binding
+  namespace: victor-system
+subjects:
+  - kind: ServiceAccount
+    name: victor-service-account
+    namespace: victor-system
+roleRef:
+  kind: Role
+  name: victor-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# StatefulSet for Vector Database
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: victor-vectordb
+  namespace: victor-system
+  labels:
+    app: vectordb
+spec:
+  serviceName: victor-vectordb
+  replicas: 3
+  selector:
+    matchLabels:
+      app: vectordb
+  template:
+    metadata:
+      labels:
+        app: vectordb
+    spec:
+      containers:
+        - name: vectordb
+          image: weaviate/weaviate:latest
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 50051
+              name: grpc
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "2"
+            limits:
+              memory: "16Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/weaviate
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 100Gi
+
+---
+# Service for Vector Database
+apiVersion: v1
+kind: Service
+metadata:
+  name: victor-vectordb
+  namespace: victor-system
+  labels:
+    app: vectordb
+spec:
+  type: ClusterIP
+  selector:
+    app: vectordb
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+
+---
+# StatefulSet for Graph Database
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: victor-graphdb
+  namespace: victor-system
+  labels:
+    app: graphdb
+spec:
+  serviceName: victor-graphdb
+  replicas: 3
+  selector:
+    matchLabels:
+      app: graphdb
+  template:
+    metadata:
+      labels:
+        app: graphdb
+    spec:
+      containers:
+        - name: neo4j
+          image: neo4j:5-enterprise
+          ports:
+            - containerPort: 7474
+              name: http
+            - containerPort: 7687
+              name: bolt
+          env:
+            - name: NEO4J_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: victor-secrets
+                  key: GRAPH_DB_PASSWORD
+            - name: NEO4J_ACCEPT_LICENSE_AGREEMENT
+              value: "yes"
+            - name: NEO4J_causal__clustering_initial__discovery__members
+              value: "victor-graphdb-0.victor-graphdb:5000,victor-graphdb-1.victor-graphdb:5000,victor-graphdb-2.victor-graphdb:5000"
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "2"
+            limits:
+              memory: "16Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 100Gi
+
+---
+# Service for Graph Database
+apiVersion: v1
+kind: Service
+metadata:
+  name: victor-graphdb
+  namespace: victor-system
+  labels:
+    app: graphdb
+spec:
+  type: ClusterIP
+  selector:
+    app: graphdb
+  ports:
+    - name: http
+      port: 7474
+      targetPort: 7474
+    - name: bolt
+      port: 7687
+      targetPort: 7687
+
+---
+# StatefulSet for Time-Series Database
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: victor-timeseriesdb
+  namespace: victor-system
+  labels:
+    app: timeseriesdb
+spec:
+  serviceName: victor-timeseriesdb
+  replicas: 3
+  selector:
+    matchLabels:
+      app: timeseriesdb
+  template:
+    metadata:
+      labels:
+        app: timeseriesdb
+    spec:
+      containers:
+        - name: influxdb
+          image: influxdb:2.7
+          ports:
+            - containerPort: 8086
+              name: http
+          env:
+            - name: INFLUXDB_HTTP_AUTH_ENABLED
+              value: "true"
+            - name: DOCKER_INFLUXDB_INIT_MODE
+              value: "setup"
+            - name: DOCKER_INFLUXDB_INIT_USERNAME
+              value: "victor"
+            - name: DOCKER_INFLUXDB_INIT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: victor-secrets
+                  key: TIMESERIES_DB_TOKEN
+            - name: DOCKER_INFLUXDB_INIT_ORG
+              value: "victor-org"
+            - name: DOCKER_INFLUXDB_INIT_BUCKET
+              value: "victor-metrics"
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "1"
+            limits:
+              memory: "8Gi"
+              cpu: "2"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/influxdb2
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 500Gi
+
+---
+# Service for Time-Series Database
+apiVersion: v1
+kind: Service
+metadata:
+  name: victor-timeseriesdb
+  namespace: victor-system
+  labels:
+    app: timeseriesdb
+spec:
+  type: ClusterIP
+  selector:
+    app: timeseriesdb
+  ports:
+    - name: http
+      port: 8086
+      targetPort: 8086

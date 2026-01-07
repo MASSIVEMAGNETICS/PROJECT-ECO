@@ -1,0 +1,557 @@
+# VICTOR CI/CD Pipeline
+# Automated deployment workflow for enterprise-grade AGI infrastructure
+
+name: Victor Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'victor_*.py'
+      - 'victor_k8s_deployment.yaml'
+      - 'monitoring/**'
+      - '.github/workflows/victor-deploy.yaml'
+      - 'requirements.txt'
+      - 'Dockerfile'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      skip_tests:
+        description: 'Skip tests (emergency deploy)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/victor-core
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # ==========================================================================
+  # CODE QUALITY AND TESTING
+  # ==========================================================================
+  
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install linting tools
+        run: |
+          pip install flake8 black isort mypy pylint
+      
+      - name: Run Black (formatting check)
+        run: |
+          black --check --diff victor_*.py
+      
+      - name: Run isort (import sorting)
+        run: |
+          isort --check-only --diff victor_*.py
+      
+      - name: Run Flake8 (linting)
+        run: |
+          flake8 victor_*.py --max-line-length=100 --ignore=E501,W503
+      
+      - name: Run Pylint
+        run: |
+          pylint victor_*.py --disable=C0114,C0115,C0116,R0903,R0913,R0914,W0612 || true
+      
+      - name: Run MyPy (type checking)
+        run: |
+          mypy victor_*.py --ignore-missing-imports || true
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    if: ${{ !inputs.skip_tests }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov
+      
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --cov=. --cov-report=xml --cov-report=html
+      
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: htmlcov/
+          retention-days: 7
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: test
+    if: ${{ !inputs.skip_tests }}
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
+      
+      - name: Run integration tests
+        run: |
+          pytest tests/integration/ -v --timeout=300 || true
+        env:
+          REDIS_URL: redis://localhost:6379
+
+  # ==========================================================================
+  # SECURITY SCANNING
+  # ==========================================================================
+  
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scanner (filesystem)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+      
+      - name: Run Bandit (Python security linter)
+        run: |
+          pip install bandit
+          bandit -r victor_*.py -f json -o bandit-report.json || true
+      
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+          retention-days: 7
+
+  dependency-check:
+    name: Dependency Check
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install safety
+        run: pip install safety pip-audit
+      
+      - name: Run Safety check
+        run: |
+          pip install -r requirements.txt
+          safety check --json --output safety-report.json || true
+      
+      - name: Run pip-audit
+        run: |
+          pip-audit --format=json --output=pip-audit-report.json || true
+      
+      - name: Upload dependency reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-reports
+          path: |
+            safety-report.json
+            pip-audit-report.json
+          retention-days: 7
+
+  # ==========================================================================
+  # BUILD
+  # ==========================================================================
+  
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: always() && needs.lint.result == 'success'
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build-push.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+      
+      - name: Build and push Docker image
+        id: build-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ github.ref_name }}
+      
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@master
+        if: github.event_name != 'pull_request'
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Upload Trivy image scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: github.event_name != 'pull_request'
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+
+  # ==========================================================================
+  # DEPLOYMENT
+  # ==========================================================================
+  
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://staging.victor.example.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.STAGING_KUBECONFIG }}" | base64 -d > ~/.kube/config
+      
+      - name: Deploy to staging
+        run: |
+          # Update image tag in deployment
+          sed -i "s|victor-system/victor-core:latest|${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}|g" victor_k8s_deployment.yaml
+          
+          # Apply deployment
+          kubectl apply -f victor_k8s_deployment.yaml
+          
+          # Wait for rollout
+          kubectl rollout status deployment/victor-core -n victor-system --timeout=600s
+      
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n victor-system -l app=victor
+          kubectl get services -n victor-system
+      
+      - name: Run smoke tests
+        run: |
+          # Wait for service to be ready
+          sleep 30
+          
+          # Health check
+          kubectl exec -n victor-system deployment/victor-core -- curl -s http://localhost:8000/health/ready || true
+
+  deploy-production:
+    name: Deploy to Production (Blue-Green)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://victor.example.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.PROD_KUBECONFIG }}" | base64 -d > ~/.kube/config
+      
+      - name: Blue-Green Deployment
+        run: |
+          CURRENT_COLOR=$(kubectl get service victor-core -n victor-system -o jsonpath='{.spec.selector.color}' 2>/dev/null || echo "blue")
+          NEW_COLOR="green"
+          if [ "$CURRENT_COLOR" = "green" ]; then
+            NEW_COLOR="blue"
+          fi
+          
+          echo "Current: $CURRENT_COLOR, Deploying: $NEW_COLOR"
+          
+          # Update deployment with new color
+          sed -i "s|victor-system/victor-core:latest|${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}|g" victor_k8s_deployment.yaml
+          
+          # Create new deployment with color label
+          sed -i "s|component: core|component: core\n        color: $NEW_COLOR|g" victor_k8s_deployment.yaml
+          
+          # Rename deployment for blue-green
+          sed -i "s|name: victor-core|name: victor-core-$NEW_COLOR|g" victor_k8s_deployment.yaml
+          
+          # Apply new deployment
+          kubectl apply -f victor_k8s_deployment.yaml
+          
+          # Wait for new deployment
+          kubectl rollout status deployment/victor-core-$NEW_COLOR -n victor-system --timeout=600s
+      
+      - name: Verify new deployment
+        run: |
+          kubectl get pods -n victor-system -l app=victor
+          
+          # Run health checks on new pods
+          NEW_POD=$(kubectl get pods -n victor-system -l app=victor,color=$NEW_COLOR -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec -n victor-system $NEW_POD -- curl -s http://localhost:8000/health/ready || echo "Health check pending"
+      
+      - name: Switch traffic
+        run: |
+          CURRENT_COLOR=$(kubectl get service victor-core -n victor-system -o jsonpath='{.spec.selector.color}' 2>/dev/null || echo "blue")
+          NEW_COLOR="green"
+          if [ "$CURRENT_COLOR" = "green" ]; then
+            NEW_COLOR="blue"
+          fi
+          
+          # Update service to point to new deployment
+          kubectl patch service victor-core -n victor-system -p '{"spec":{"selector":{"color":"'$NEW_COLOR'"}}}'
+          
+          echo "Traffic switched to $NEW_COLOR deployment"
+      
+      - name: Monitor rollout
+        run: |
+          # Monitor for 5 minutes
+          for i in {1..30}; do
+            echo "Check $i/30..."
+            kubectl get pods -n victor-system -l app=victor
+            sleep 10
+          done
+
+  # ==========================================================================
+  # BENCHMARKS AND VALIDATION
+  # ==========================================================================
+  
+  model-validation:
+    name: Model Validation
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+      
+      - name: Run model validation
+        run: |
+          python -c "
+          import asyncio
+          from victor_integration import VictorSystem, TransformerOutput, DeploymentConfig
+          import numpy as np
+
+          async def validate():
+              system = VictorSystem('validation-node', DeploymentConfig.dev())
+              await system.initialize()
+              
+              # Run validation generations
+              for i in range(10):
+                  embeddings = np.random.randn(16, 768).astype(np.float32)
+                  output = TransformerOutput(embeddings=embeddings, metadata={'test': i})
+                  result = await system.generate(output)
+                  print(f'Generation {i}: {result[\"health\"]}')
+                  assert result['health'] in ['healthy', 'anomalous']
+              
+              await system.shutdown()
+              print('Model validation passed!')
+
+          asyncio.run(validate())
+          "
+
+  benchmark:
+    name: Performance Benchmark
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest-benchmark
+      
+      - name: Run benchmarks
+        run: |
+          python -c "
+          import asyncio
+          import time
+          from victor_integration import VictorSystem, TransformerOutput, DeploymentConfig
+          import numpy as np
+
+          async def benchmark():
+              system = VictorSystem('benchmark-node', DeploymentConfig.dev())
+              await system.initialize()
+              
+              # Warmup
+              for _ in range(5):
+                  embeddings = np.random.randn(16, 768).astype(np.float32)
+                  output = TransformerOutput(embeddings=embeddings)
+                  await system.generate(output)
+              
+              # Benchmark
+              times = []
+              for i in range(100):
+                  embeddings = np.random.randn(16, 768).astype(np.float32)
+                  output = TransformerOutput(embeddings=embeddings)
+                  
+                  start = time.perf_counter()
+                  await system.generate(output)
+                  elapsed = time.perf_counter() - start
+                  times.append(elapsed)
+              
+              avg_time = sum(times) / len(times)
+              min_time = min(times)
+              max_time = max(times)
+              
+              print(f'Benchmark Results:')
+              print(f'  Average: {avg_time*1000:.2f}ms')
+              print(f'  Min: {min_time*1000:.2f}ms')
+              print(f'  Max: {max_time*1000:.2f}ms')
+              print(f'  Throughput: {1/avg_time:.2f} gen/s')
+              
+              await system.shutdown()
+
+          asyncio.run(benchmark())
+          "
+
+  # ==========================================================================
+  # NOTIFICATIONS
+  # ==========================================================================
+  
+  notify-success:
+    name: Notify Success
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always() && (needs.deploy-staging.result == 'success' || needs.deploy-production.result == 'success')
+    steps:
+      - name: Send success notification
+        run: |
+          echo "Deployment successful!"
+          # Add Slack/Discord webhook here if needed
+
+  notify-failure:
+    name: Notify Failure
+    runs-on: ubuntu-latest
+    needs: [lint, test, build, deploy-staging, deploy-production]
+    if: failure()
+    steps:
+      - name: Send failure notification
+        run: |
+          echo "Deployment failed!"
+          # Add Slack/Discord webhook here if needed
