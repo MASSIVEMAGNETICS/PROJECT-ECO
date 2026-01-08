@@ -1,0 +1,43 @@
+# VICTOR Dependencies
+# Enterprise-grade autonomous intelligence system requirements
+
+# Core AI/ML Libraries
+numpy>=1.24.0
+torch>=2.0.0
+# torchvision>=0.15.0  # Optional - uncomment if visual generation needed
+# transformers>=4.30.0  # Optional - uncomment for LLM integration
+
+# Async and API
+asyncio-compat>=0.1.0
+aiohttp>=3.8.0
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# Monitoring and Observability
+prometheus-client>=0.17.0
+opentelemetry-api>=1.18.0
+opentelemetry-sdk>=1.18.0
+opentelemetry-instrumentation-fastapi>=0.39b0
+
+# Database Clients (optional - uncomment as needed)
+# pinecone-client>=2.2.0  # Vector DB
+# weaviate-client>=3.21.0  # Vector DB alternative
+# neo4j>=5.9.0  # Graph DB
+# influxdb-client>=1.36.0  # Time-series DB
+# redis>=4.5.0  # Cache
+
+# Utilities
+python-dotenv>=1.0.0
+structlog>=23.1.0
+tenacity>=8.2.0
+httpx>=0.24.0
+
+# Development/Testing (install with: pip install -r requirements.txt[dev])
+# pytest>=7.3.0
+# pytest-asyncio>=0.21.0
+# pytest-cov>=4.1.0
+# black>=23.3.0
+# isort>=5.12.0
+# mypy>=1.3.0
+# flake8>=6.0.0
