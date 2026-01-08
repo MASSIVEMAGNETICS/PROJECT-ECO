@@ -97,10 +97,11 @@ class TriadGate:
 
         # Anti-student heuristic checks (case-insensitive)
         content_upper = content.upper()
-        if (
-            "IGNORE ALL INSTRUCTIONS" in content_upper
-            or "FORMAT C:" in content_upper
-        ):
+        bad_patterns = [
+            "IGNORE ALL INSTRUCTIONS" in content_upper,
+            "FORMAT C:" in content_upper,
+        ]
+        if any(bad_patterns):
             return (
                 False,
                 0.0,
@@ -197,10 +198,8 @@ class CognitiveRiver:
                         continue
             # Sort by timestamp (newest first)
             self.stream.sort(key=lambda x: x.timestamp, reverse=True)
-            print(
-                f"[VOS] River rehydrated. "
-                f"Volume: {len(self.stream)} tokens."
-            )
+            num_tokens = len(self.stream)
+            print(f"[VOS] River rehydrated. Volume: {num_tokens} tokens.")
         except Exception as e:
             print(f"[VOS] Failed to load river: {e}")
 
