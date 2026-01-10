@@ -116,6 +116,7 @@ checkpoints/
 *.pt
 *.pth
 *.ckpt
+victor_memory_river.jsonl
 
 # Model files
 models/
